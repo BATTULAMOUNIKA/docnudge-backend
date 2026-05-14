@@ -958,7 +958,7 @@ def list_demo_requests(db: Session = Depends(get_db)):
 def create_user(data: UserIn, db: Session = Depends(get_db)):
     try:
         if db.query(User).filter(User.email == data.email).first():
-            raise HTTPException(status_code=400, detail="Email already exists")
+            raise HTTPException(status_code=400, detail="This login email is already assigned to another account. Please use a different email for each doctor login.")
         user = User(
             email=data.email,
             password=hash_password(data.password),
@@ -992,7 +992,7 @@ def update_user(user_id: int, data: UserUpdateIn, db: Session = Depends(get_db))
         if data.email:
             existing = db.query(User).filter(User.email == data.email, User.id != user_id).first()
             if existing:
-                raise HTTPException(status_code=400, detail="Email already exists")
+                raise HTTPException(status_code=400, detail="This login email is already assigned to another account. Please use a different email for each doctor login.")
 
         payload = _model_data(data, exclude_unset=True)
         next_password = payload.pop("password", None)
