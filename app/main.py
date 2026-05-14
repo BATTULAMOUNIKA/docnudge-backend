@@ -1913,7 +1913,29 @@ def patient_test_login(db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Testing login is disabled")
     patient = _find_testing_patient(db)
     if not patient:
-        raise HTTPException(status_code=404, detail="No patient records are available for testing")
+        # Create a demo patient so testing always works
+        from datetime import date as _date
+        patient = Patient(
+            name="Demo Patient",
+            phone="9999999999",
+            condition="General consultation",
+            age=30,
+            gender="Male",
+            address="DocNudge Demo Clinic, Hyderabad",
+            clinic_id=None,
+        )
+        db.add(patient)
+        db.flush()
+        # Add a sample visit
+        demo_visit = Visit(
+            patient_id=patient.id,
+            visit_date=_date.today(),
+            status="completed",
+            notes="Demo visit — patient reports general fatigue and mild headache.",
+        )
+        db.add(demo_visit)
+        db.commit()
+        db.refresh(patient)
 
     _ensure_emergency_token(patient)
     db.commit()
