@@ -185,6 +185,7 @@ def user_out(user: User) -> dict:
         "id": user.id,
         "email": user.email,
         "name": user.name,
+        "phone": user.phone,
         "designation": user.designation,
         "role": user.role,
         "clinic_id": user.clinic_id,
@@ -400,6 +401,7 @@ def run_migrations():
 
             if "users" in tables:
                 _add_column_if_missing(conn, "users", "name", "VARCHAR")
+                _add_column_if_missing(conn, "users", "phone", "VARCHAR")
                 _add_column_if_missing(conn, "users", "designation", "VARCHAR")
                 conn.execute(text("""
                     UPDATE users
@@ -557,8 +559,19 @@ class UserIn(BaseModel):
     email:     str
     password:  str
     name:      str | None = None
+    phone:     str | None = None
     designation: str | None = None
     role:      str = "doctor"
+    clinic_id: int | None = None
+
+
+class UserUpdateIn(BaseModel):
+    email: str | None = None
+    password: str | None = None
+    name: str | None = None
+    phone: str | None = None
+    designation: str | None = None
+    role: str | None = None
     clinic_id: int | None = None
 
 class RetentionPatientIn(BaseModel):
@@ -595,6 +608,7 @@ class CloseCaseIn(BaseModel):
 class ClinicProfileIn(BaseModel):
     name: str | None = None
     city: str | None = None
+    plan: str | None = None
     email: str | None = None
     phone: str | None = None
     doctor_name: str | None = None
@@ -745,6 +759,9 @@ class ClinicCreateIn(BaseModel):
     name: str
     city: str | None = None
     plan: str | None = "trial"
+    email: str | None = None
+    phone: str | None = None
+    address: str | None = None
     doctor_name: str | None = None
     designation: str | None = None
 
@@ -946,6 +963,7 @@ def create_user(data: UserIn, db: Session = Depends(get_db)):
             email=data.email,
             password=hash_password(data.password),
             name=data.name,
+            phone=data.phone,
             designation=data.designation,
             role=data.role,
             clinic_id=data.clinic_id,
@@ -958,6 +976,58 @@ def create_user(data: UserIn, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         logging.exception("create_user failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
+def update_user(user_id: int, data: UserUpdateIn, db: Session = Depends(get_db)):
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if user.role != "doctor":
+            raise HTTPException(status_code=400, detail="Only doctor accounts can be edited here")
+        if data.role is not None and data.role != "doctor":
+            raise HTTPException(status_code=400, detail="Doctor accounts must keep the doctor role")
+        if data.email:
+            existing = db.query(User).filter(User.email == data.email, User.id != user_id).first()
+            if existing:
+                raise HTTPException(status_code=400, detail="Email already exists")
+
+        payload = _model_data(data, exclude_unset=True)
+        next_password = payload.pop("password", None)
+        payload.pop("role", None)
+
+        for field, value in payload.items():
+            setattr(user, field, value)
+        if next_password:
+            user.password = hash_password(next_password)
+
+        db.commit()
+        db.refresh(user)
+        return user_out(user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logging.exception("update_user failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/admin/users/{user_id}", dependencies=[Depends(require_admin)])
+def delete_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role != "doctor":
+        raise HTTPException(status_code=400, detail="Only doctor accounts can be deleted here")
+    try:
+        db.delete(user)
+        db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        logging.exception("delete_user failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── Clinic routes ──────────────────────────────────────────
@@ -975,14 +1045,19 @@ def create_clinic(
         clinic = Clinic(
             name=clinic_name,
             city=data.city if data else None,
+            email=data.email if data else None,
+            phone=data.phone if data else None,
             doctor_name=data.doctor_name if data else None,
             designation=data.designation if data else None,
+            address=data.address if data else None,
             subscription_plan=(data.plan if data and data.plan else "trial"),
         )
         db.add(clinic)
         db.commit()
         db.refresh(clinic)
         return clinic_out(clinic)
+    except HTTPException:
+        raise
     except Exception as e:
         logging.exception("create_clinic failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1011,7 +1086,10 @@ def update_clinic_profile(
         clinic = db.query(Clinic).filter(Clinic.id == clinic_id).first()
         if not clinic:
             raise HTTPException(status_code=404, detail="Clinic not found")
-        for field, value in _model_data(data, exclude_unset=True).items():
+        payload = _model_data(data, exclude_unset=True)
+        if payload.get("plan") is not None:
+            payload["subscription_plan"] = payload.pop("plan")
+        for field, value in payload.items():
             if value is not None:
                 setattr(clinic, field, value)
         if not clinic.trial_ends_at:

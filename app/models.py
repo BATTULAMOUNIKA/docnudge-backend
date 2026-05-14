@@ -86,6 +86,7 @@ class User(Base):
     email      = Column(String, unique=True, nullable=False)
     password   = Column(String, nullable=False)
     name       = Column(String)
+    phone      = Column(String)
     designation = Column(String)
     role       = Column(String, default="receptionist")
     clinic_id  = Column(Integer, ForeignKey("clinics.id"), nullable=True)
