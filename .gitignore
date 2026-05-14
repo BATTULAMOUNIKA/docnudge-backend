@@ -1,0 +1,11 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.DS_Store
+clinicdb.sqlite
+_alembic_gen.db
+.git-history-backup/
