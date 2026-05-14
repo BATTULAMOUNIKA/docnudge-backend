@@ -76,6 +76,20 @@ def _ensure_patient_mrn(db: Session, patient: Patient) -> str | None:
     db.flush()
     return patient.mrn
 
+def _doctor_name_for_user(user: User | None, clinic: Clinic | None = None) -> str | None:
+    if user and user.name:
+        return user.name
+    if clinic and clinic.doctor_name:
+        return clinic.doctor_name
+    return None
+
+def _designation_for_user(user: User | None, clinic: Clinic | None = None) -> str | None:
+    if user and user.designation:
+        return user.designation
+    if clinic and clinic.designation:
+        return clinic.designation
+    return None
+
 def clinic_out(clinic: Clinic) -> dict:
     billing_status = clinic.billing_status or "trialing"
     subscription_plan = clinic.subscription_plan or "trial"
@@ -112,6 +126,12 @@ def clinic_out(clinic: Clinic) -> dict:
 
 def patient_out(patient: Patient) -> dict:
     clinic = patient.clinic
+    latest_visit = None
+    if patient.visits:
+        latest_visit = max(
+            patient.visits,
+            key=lambda visit: (visit.visit_date or date.min, visit.created_at or datetime.min),
+        )
     return {
         "id": patient.id,
         "clinic_id": patient.clinic_id,
@@ -135,7 +155,8 @@ def patient_out(patient: Patient) -> dict:
         "opted_out": bool(patient.opted_out),
         "reminder_enabled": bool(patient.reminder_enabled),
         "followup_enabled": bool(patient.followup_enabled),
-        "doctor_name": clinic.doctor_name if clinic else None,
+        "doctor_name": (latest_visit.doctor_name if latest_visit and latest_visit.doctor_name else (clinic.doctor_name if clinic else None)),
+        "doctor_designation": (latest_visit.doctor_designation if latest_visit and latest_visit.doctor_designation else (clinic.designation if clinic else None)),
         "created_at": _dt(patient.created_at),
     }
 
@@ -146,6 +167,8 @@ def visit_out(visit: Visit) -> dict:
         "id": visit.id,
         "patient_id": visit.patient_id,
         "condition": visit.condition,
+        "doctor_name": visit.doctor_name,
+        "doctor_designation": visit.doctor_designation,
         "visit_date": _dt(visit.visit_date),
         "followup_date": _dt(followup_date),
         "followup_status": followup_status,
@@ -161,6 +184,8 @@ def user_out(user: User) -> dict:
     return {
         "id": user.id,
         "email": user.email,
+        "name": user.name,
+        "designation": user.designation,
         "role": user.role,
         "clinic_id": user.clinic_id,
         "created_at": _dt(user.created_at),
@@ -174,8 +199,8 @@ def user_out_with_clinic(user: User, db: Session) -> dict:
         payload.update(
             {
                 "clinic_name": clinic.name,
-                "doctor_name": clinic.doctor_name,
-                "designation": clinic.designation,
+                "doctor_name": _doctor_name_for_user(user, clinic),
+                "designation": _designation_for_user(user, clinic),
             }
         )
     return payload
@@ -324,6 +349,8 @@ def run_migrations():
 
             if "visits" in tables:
                 _add_column_if_missing(conn, "visits", "condition", "VARCHAR")
+                _add_column_if_missing(conn, "visits", "doctor_name", "VARCHAR")
+                _add_column_if_missing(conn, "visits", "doctor_designation", "VARCHAR")
                 _add_column_if_missing(conn, "visits", "followup_date", "DATE")
                 _add_column_if_missing(conn, "visits", "followup_status", "VARCHAR DEFAULT 'due'")
                 _add_column_if_missing(conn, "visits", "status", "VARCHAR DEFAULT 'upcoming'")
@@ -333,6 +360,22 @@ def run_migrations():
                 conn.execute(text("UPDATE visits SET followup_status = status WHERE followup_status IS NULL AND status IS NOT NULL"))
                 conn.execute(text("UPDATE visits SET followup_status = 'due' WHERE followup_status IS NULL"))
                 conn.execute(text("UPDATE visits SET status = 'upcoming' WHERE status IS NULL"))
+                conn.execute(text("""
+                    UPDATE visits
+                    SET doctor_name = clinics.doctor_name
+                    FROM patients, clinics
+                    WHERE visits.patient_id = patients.id
+                      AND patients.clinic_id = clinics.id
+                      AND visits.doctor_name IS NULL
+                """))
+                conn.execute(text("""
+                    UPDATE visits
+                    SET doctor_designation = clinics.designation
+                    FROM patients, clinics
+                    WHERE visits.patient_id = patients.id
+                      AND patients.clinic_id = clinics.id
+                      AND visits.doctor_designation IS NULL
+                """))
 
             if "clinics" in tables:
                 _add_column_if_missing(conn, "clinics", "city", "VARCHAR")
@@ -354,6 +397,17 @@ def run_migrations():
                 conn.execute(text("UPDATE clinics SET billing_status = 'trialing' WHERE billing_status IS NULL"))
                 conn.execute(text("UPDATE clinics SET widget_primary_color = '#0f766e' WHERE widget_primary_color IS NULL"))
                 conn.execute(text("UPDATE clinics SET widget_enabled = TRUE WHERE widget_enabled IS NULL"))
+
+            if "users" in tables:
+                _add_column_if_missing(conn, "users", "name", "VARCHAR")
+                _add_column_if_missing(conn, "users", "designation", "VARCHAR")
+                conn.execute(text("""
+                    UPDATE users
+                    SET designation = clinics.designation
+                    FROM clinics
+                    WHERE users.clinic_id = clinics.id
+                      AND users.designation IS NULL
+                """))
 
             if "demo_requests" in tables:
                 _add_column_if_missing(conn, "demo_requests", "city", "VARCHAR")
@@ -377,6 +431,15 @@ def backfill_patient_metadata():
     db = SessionLocal()
     try:
         changed = False
+        clinics_by_id = {clinic.id: clinic for clinic in db.query(Clinic).all()}
+        for user in db.query(User).all():
+            clinic = clinics_by_id.get(user.clinic_id)
+            if not user.name and user.role == "doctor":
+                user.name = clinic.doctor_name if clinic and clinic.doctor_name else user.email.split("@")[0].replace(".", " ").title()
+                changed = True
+            if not user.designation and clinic and clinic.designation:
+                user.designation = clinic.designation
+                changed = True
         for patient in db.query(Patient).all():
             next_mrn = _patient_mrn_value(patient.clinic_id, patient.id)
             if next_mrn and patient.mrn != next_mrn:
@@ -387,6 +450,14 @@ def backfill_patient_metadata():
                 changed = True
             if patient.followup_enabled is None:
                 patient.followup_enabled = True
+                changed = True
+        for visit in db.query(Visit).join(Patient, Visit.patient_id == Patient.id).all():
+            clinic = clinics_by_id.get(visit.patient.clinic_id if visit.patient else None)
+            if not visit.doctor_name and clinic and clinic.doctor_name:
+                visit.doctor_name = clinic.doctor_name
+                changed = True
+            if not visit.doctor_designation and clinic and clinic.designation:
+                visit.doctor_designation = clinic.designation
                 changed = True
         if changed:
             db.commit()
@@ -485,7 +556,9 @@ class VisitIn(BaseModel):
 class UserIn(BaseModel):
     email:     str
     password:  str
-    role:      str = "receptionist"
+    name:      str | None = None
+    designation: str | None = None
+    role:      str = "doctor"
     clinic_id: int | None = None
 
 class RetentionPatientIn(BaseModel):
@@ -712,14 +785,16 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
         if not user or not verify_password(form.password, user.password):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         clinic = db.query(Clinic).filter(Clinic.id == user.clinic_id).first() if user.clinic_id else None
+        doctor_name = _doctor_name_for_user(user, clinic)
+        designation = _designation_for_user(user, clinic)
         token = create_token(
             {
                 "sub": str(user.id),
                 "role": user.role,
                 "clinic_id": user.clinic_id,
                 "clinic_name": clinic.name if clinic else None,
-                "doctor_name": clinic.doctor_name if clinic else None,
-                "designation": clinic.designation if clinic else None,
+                "doctor_name": doctor_name,
+                "designation": designation,
             }
         )
         return {
@@ -728,8 +803,9 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
             "role": user.role,
             "clinic_id": user.clinic_id,
             "clinic_name": clinic.name if clinic else None,
-            "doctor_name": clinic.doctor_name if clinic else None,
-            "designation": clinic.designation if clinic else None,
+            "doctor_name": doctor_name,
+            "designation": designation,
+            "name": user.name,
         }
     except HTTPException:
         raise
@@ -775,13 +851,24 @@ def clinic_settings(
     if not clinic:
         raise HTTPException(status_code=404, detail="Clinic not found")
     payload = _model_data(data, exclude_unset=True)
-    if "speciality" in payload and "designation" not in payload:
-        payload["designation"] = payload.pop("speciality")
+    user_designation = payload.pop("designation", None)
+    if user_designation is None and "speciality" in payload:
+        user_designation = payload.pop("speciality")
+    user_name = payload.pop("doctor_name", None)
     for field, value in payload.items():
         setattr(clinic, field, value)
+    if user_name is not None:
+        user.name = user_name
+    if user_designation is not None:
+        user.designation = user_designation
     db.commit()
     db.refresh(clinic)
-    return clinic_out(clinic)
+    db.refresh(user)
+    payload = clinic_out(clinic)
+    payload["doctor_name"] = _doctor_name_for_user(user, clinic)
+    payload["designation"] = _designation_for_user(user, clinic)
+    payload["user_name"] = user.name
+    return payload
 
 
 @app.put("/settings/reminders")
@@ -858,6 +945,8 @@ def create_user(data: UserIn, db: Session = Depends(get_db)):
         user = User(
             email=data.email,
             password=hash_password(data.password),
+            name=data.name,
+            designation=data.designation,
             role=data.role,
             clinic_id=data.clinic_id,
         )
@@ -1167,10 +1256,16 @@ def complete_appointment(
             _ensure_patient_mrn(db, patient)
         elif data and data.condition:
             patient.condition = data.condition
+        if patient.source == "appointment_queue":
+            patient.source = "appointment"
+
+        clinic = db.query(Clinic).filter(Clinic.id == appointment.clinic_id).first()
 
         visit = Visit(
             patient_id=patient.id,
             condition=(data.condition if data else None) or patient.condition or appointment.service_type,
+            doctor_name=_doctor_name_for_user(user, clinic),
+            doctor_designation=_designation_for_user(user, clinic),
             visit_date=appointment.appointment_date or date.today(),
             notes=(data.notes if data else None) or appointment.notes,
             prescription_text=data.prescription_text if data else None,
@@ -1450,6 +1545,14 @@ def _find_patient_by_phone(db: Session, phone: str) -> Patient | None:
         .first()
     )
 
+def _find_testing_patient(db: Session) -> Patient | None:
+    configured_phone = os.getenv("PATIENT_TEST_PHONE", "").strip()
+    if configured_phone:
+        patient = _find_patient_by_phone(db, configured_phone)
+        if patient:
+            return patient
+    return db.query(Patient).order_by(Patient.created_at.desc(), Patient.id.desc()).first()
+
 def _get_patient_from_token(token: str, db: Session) -> Patient:
     payload = decode_token(token)
     sub = payload.get("sub")
@@ -1566,6 +1669,28 @@ def patient_phone_login(data: PatientPhoneLoginIn, db: Session = Depends(get_db)
         }
     )
     return {"token": token, "patient": _portal_patient_payload(patient, db)}
+
+
+@app.post("/patient/auth/test-login")
+def patient_test_login(db: Session = Depends(get_db)):
+    if os.getenv("PATIENT_TEST_LOGIN_ENABLED", "").strip().lower() not in {"1", "true", "yes"}:
+        raise HTTPException(status_code=404, detail="Testing login is disabled")
+    patient = _find_testing_patient(db)
+    if not patient:
+        raise HTTPException(status_code=404, detail="No patient records are available for testing")
+
+    _ensure_emergency_token(patient)
+    db.commit()
+    clinic = _clinic_for_patient(db, patient)
+    token = create_token(
+        {
+            "sub": f"patient:{patient.id}",
+            "role": "patient",
+            "clinic_id": patient.clinic_id,
+            "clinic_name": clinic.name if clinic else None,
+        }
+    )
+    return {"token": token, "patient": _portal_patient_payload(patient, db), "testing": True}
 
 
 @app.post("/patient/auth/send-otp")
@@ -2392,7 +2517,7 @@ def list_patients(
 ):
     try:
         require_clinic_access(clinic_id, user)
-        query = db.query(Patient).filter(Patient.clinic_id == clinic_id)
+        query = db.query(Patient).filter(Patient.clinic_id == clinic_id).filter(Patient.source != "appointment_queue")
         if search:
             like = f"%{search.strip()}%"
             query = query.filter(
@@ -2404,7 +2529,7 @@ def list_patients(
                     Patient.followup_type.ilike(like),
                 )
             )
-        patients = query.order_by(Patient.created_at.desc(), Patient.id.desc()).all()
+        patients = query.order_by(Patient.last_visit_at.desc().nullslast(), Patient.created_at.desc(), Patient.id.desc()).all()
         return [patient_out(patient) for patient in patients]
     except HTTPException:
         raise
@@ -2417,9 +2542,12 @@ def list_patients(
 def add_visit(data: VisitIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     try:
         patient = _patient_for_user(data.patient_id, user, db)
+        clinic = db.query(Clinic).filter(Clinic.id == patient.clinic_id).first()
         visit = Visit(
             patient_id=data.patient_id,
             condition=data.condition or patient.condition,
+            doctor_name=_doctor_name_for_user(user, clinic),
+            doctor_designation=_designation_for_user(user, clinic),
             visit_date=data.visit_date,
             next_visit=data.followup_date or data.next_visit,
             followup_date=data.followup_date or data.next_visit,
@@ -2431,6 +2559,8 @@ def add_visit(data: VisitIn, user: User = Depends(get_current_user), db: Session
         )
         if data.condition:
             patient.condition = data.condition
+        if patient.source == "appointment_queue":
+            patient.source = "appointment"
         patient.last_visit_at = data.visit_date
         db.add(visit)
         db.commit()
