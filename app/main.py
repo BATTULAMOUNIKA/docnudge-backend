@@ -1915,14 +1915,23 @@ def patient_test_login(db: Session = Depends(get_db)):
     if not patient:
         # Create a demo patient so testing always works
         from datetime import date as _date
+        # Get any existing clinic, or create a demo one
+        demo_clinic = db.query(Clinic).first()
+        if not demo_clinic:
+            demo_clinic = Clinic(
+                name="Demo Clinic",
+                doctor_name="Demo Doctor",
+                phone="9999900000",
+            )
+            db.add(demo_clinic)
+            db.flush()
         patient = Patient(
             name="Demo Patient",
             phone="9999999999",
             condition="General consultation",
             age=30,
             gender="Male",
-            address="DocNudge Demo Clinic, Hyderabad",
-            clinic_id=None,
+            clinic_id=demo_clinic.id,
         )
         db.add(patient)
         db.flush()
