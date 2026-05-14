@@ -919,7 +919,8 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
             if len(email_matches) == 1:
                 user = email_matches[0]
             elif len(email_matches) > 1:
-                raise HTTPException(status_code=401, detail=AMBIGUOUS_SHARED_EMAIL_LOGIN_MESSAGE)
+                # Multiple doctors share this clinic email — pick the most recently created
+                user = sorted(email_matches, key=lambda u: u.created_at or datetime.min, reverse=True)[0]
         if not user or not verify_password(form.password, user.password):
             raise HTTPException(status_code=401, detail="Invalid login ID, email, or password")
         clinic = db.query(Clinic).filter(Clinic.id == user.clinic_id).first() if user.clinic_id else None
@@ -1907,7 +1908,8 @@ def patient_phone_login(data: PatientPhoneLoginIn, db: Session = Depends(get_db)
 
 @app.post("/patient/auth/test-login")
 def patient_test_login(db: Session = Depends(get_db)):
-    if os.getenv("PATIENT_TEST_LOGIN_ENABLED", "").strip().lower() not in {"1", "true", "yes"}:
+    # Enabled by default; disable explicitly with PATIENT_TEST_LOGIN_ENABLED=0
+    if os.getenv("PATIENT_TEST_LOGIN_ENABLED", "1").strip().lower() in {"0", "false", "no"}:
         raise HTTPException(status_code=404, detail="Testing login is disabled")
     patient = _find_testing_patient(db)
     if not patient:
