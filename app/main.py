@@ -49,6 +49,8 @@ import uuid
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="Clinic Reminder Engine")
 
+DUPLICATE_DOCTOR_EMAIL_MESSAGE = "This login email is already assigned to another account. Please use a different email for each doctor login."
+
 def _dt(value):
     return value.isoformat() if value else None
 
@@ -56,6 +58,14 @@ def _model_data(model: BaseModel, exclude_unset: bool = False) -> dict:
     if hasattr(model, "model_dump"):
         return model.model_dump(exclude_unset=exclude_unset)
     return model.dict(exclude_unset=exclude_unset)
+
+def _is_duplicate_user_email_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return (
+        "email already exists" in message
+        or "unique constraint failed" in message
+        or "users.email" in message
+    )
 
 def _digits_only(value: str | None) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
@@ -958,7 +968,7 @@ def list_demo_requests(db: Session = Depends(get_db)):
 def create_user(data: UserIn, db: Session = Depends(get_db)):
     try:
         if db.query(User).filter(User.email == data.email).first():
-            raise HTTPException(status_code=400, detail="This login email is already assigned to another account. Please use a different email for each doctor login.")
+            raise HTTPException(status_code=400, detail=DUPLICATE_DOCTOR_EMAIL_MESSAGE)
         user = User(
             email=data.email,
             password=hash_password(data.password),
@@ -975,6 +985,8 @@ def create_user(data: UserIn, db: Session = Depends(get_db)):
     except HTTPException:
         raise
     except Exception as e:
+        if _is_duplicate_user_email_error(e):
+            raise HTTPException(status_code=400, detail=DUPLICATE_DOCTOR_EMAIL_MESSAGE)
         logging.exception("create_user failed")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -992,7 +1004,7 @@ def update_user(user_id: int, data: UserUpdateIn, db: Session = Depends(get_db))
         if data.email:
             existing = db.query(User).filter(User.email == data.email, User.id != user_id).first()
             if existing:
-                raise HTTPException(status_code=400, detail="This login email is already assigned to another account. Please use a different email for each doctor login.")
+                raise HTTPException(status_code=400, detail=DUPLICATE_DOCTOR_EMAIL_MESSAGE)
 
         payload = _model_data(data, exclude_unset=True)
         next_password = payload.pop("password", None)
@@ -1010,6 +1022,8 @@ def update_user(user_id: int, data: UserUpdateIn, db: Session = Depends(get_db))
         raise
     except Exception as e:
         db.rollback()
+        if _is_duplicate_user_email_error(e):
+            raise HTTPException(status_code=400, detail=DUPLICATE_DOCTOR_EMAIL_MESSAGE)
         logging.exception("update_user failed")
         raise HTTPException(status_code=500, detail=str(e))
 
