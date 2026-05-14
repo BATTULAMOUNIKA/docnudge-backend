@@ -1077,12 +1077,33 @@ def list_demo_requests(db: Session = Depends(get_db)):
         logging.exception("list_demo_requests failed")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _unique_login_id(base: str, db: Session, exclude_id: int | None = None) -> str:
+    """Return base if available, otherwise base_2, base_3, … until a free slot is found."""
+    candidate = base
+    counter = 2
+    while True:
+        q = db.query(User).filter(User.login_id == candidate)
+        if exclude_id is not None:
+            q = q.filter(User.id != exclude_id)
+        if not q.first():
+            return candidate
+        candidate = f"{base}_{counter}"
+        counter += 1
+
+
 @app.post("/admin/users", dependencies=[Depends(require_admin)])
 def create_user(data: UserIn, db: Session = Depends(get_db)):
     try:
-        login_id = _normalize_login_id(data.login_id, data.email, data.name, data.role)
-        if db.query(User).filter(User.login_id == login_id).first():
-            raise HTTPException(status_code=400, detail=DUPLICATE_LOGIN_ID_MESSAGE)
+        base_login_id = _normalize_login_id(data.login_id, data.email, data.name, data.role)
+        # If an explicit login_id was provided and it's already taken, raise clearly.
+        if data.login_id and data.login_id.strip():
+            explicit = str(data.login_id).strip().lower()
+            if db.query(User).filter(User.login_id == explicit).first():
+                raise HTTPException(status_code=400, detail=DUPLICATE_LOGIN_ID_MESSAGE)
+            login_id = explicit
+        else:
+            # Auto-derive a unique login_id so same-email doctors can coexist.
+            login_id = _unique_login_id(base_login_id, db)
         user = User(
             email=data.email,
             login_id=login_id,
