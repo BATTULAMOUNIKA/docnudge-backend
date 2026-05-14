@@ -10,6 +10,7 @@ from app.models import (
     AIConversation,
     Appointment,
     Clinic,
+    DemoRequest,
     Patient,
     ReminderLog,
     LabResult,
@@ -212,6 +213,21 @@ def weekly_report_out(report: WeeklyReport) -> dict:
         "created_at": _dt(report.created_at),
     }
 
+def demo_request_out(request: DemoRequest) -> dict:
+    return {
+        "id": request.id,
+        "name": request.name,
+        "clinic": request.clinic,
+        "email": request.email,
+        "phone": request.phone,
+        "role": request.role,
+        "city": request.city,
+        "message": request.message,
+        "source": request.source or "landing",
+        "status": request.status or "new",
+        "created_at": _dt(request.created_at),
+    }
+
 # ── CORS ───────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
@@ -315,6 +331,14 @@ def run_migrations():
                 conn.execute(text("UPDATE clinics SET billing_status = 'trialing' WHERE billing_status IS NULL"))
                 conn.execute(text("UPDATE clinics SET widget_primary_color = '#0f766e' WHERE widget_primary_color IS NULL"))
                 conn.execute(text("UPDATE clinics SET widget_enabled = TRUE WHERE widget_enabled IS NULL"))
+
+            if "demo_requests" in tables:
+                _add_column_if_missing(conn, "demo_requests", "city", "VARCHAR")
+                _add_column_if_missing(conn, "demo_requests", "message", "TEXT")
+                _add_column_if_missing(conn, "demo_requests", "source", "VARCHAR DEFAULT 'landing'")
+                _add_column_if_missing(conn, "demo_requests", "status", "VARCHAR DEFAULT 'new'")
+                conn.execute(text("UPDATE demo_requests SET source = 'landing' WHERE source IS NULL"))
+                conn.execute(text("UPDATE demo_requests SET status = 'new' WHERE status IS NULL"))
 
             if "patients" in tables:
                 logging.info("patients columns after migration: %s", sorted(_columns_for(conn, "patients")))
@@ -507,6 +531,16 @@ class PublicBookingIn(BaseModel):
     appointment_date: date
     appointment_time: str
     session_id: str | None = None
+
+class DemoRequestIn(BaseModel):
+    name: str
+    clinic: str
+    email: str
+    phone: str
+    role: str
+    city: str | None = None
+    message: str | None = None
+    source: str | None = "landing"
 
 class WidgetChatIn(BaseModel):
     clinic_id: int
@@ -753,6 +787,15 @@ def list_users(db: Session = Depends(get_db)):
         return [user_out(user) for user in users]
     except Exception as e:
         logging.exception("list_users failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/demo-requests", dependencies=[Depends(require_admin)])
+def list_demo_requests(db: Session = Depends(get_db)):
+    try:
+        requests = db.query(DemoRequest).order_by(DemoRequest.created_at.desc(), DemoRequest.id.desc()).all()
+        return [demo_request_out(item) for item in requests]
+    except Exception as e:
+        logging.exception("list_demo_requests failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/users", dependencies=[Depends(require_admin)])
@@ -1175,6 +1218,26 @@ def public_create_booking(data: PublicBookingIn, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(appointment)
     return {"appointment": appointment_out(appointment), "message": "Appointment booked"}
+
+@app.post("/public/demo-requests")
+def create_demo_request(data: DemoRequestIn, db: Session = Depends(get_db)):
+    payload = _model_data(data)
+    for field in ("name", "clinic", "email", "phone", "role"):
+        value = str(payload.get(field) or "").strip()
+        if not value:
+            raise HTTPException(status_code=400, detail=f"{field.replace('_', ' ').title()} is required")
+        payload[field] = value
+
+    payload["city"] = str(payload.get("city") or "").strip() or None
+    payload["message"] = str(payload.get("message") or "").strip() or None
+    payload["source"] = str(payload.get("source") or "landing").strip() or "landing"
+    payload["status"] = "new"
+
+    request = DemoRequest(**payload)
+    db.add(request)
+    db.commit()
+    db.refresh(request)
+    return {"request": demo_request_out(request), "message": "Demo request received"}
 
 @app.post("/public/widget-chat")
 def public_widget_chat(data: WidgetChatIn, db: Session = Depends(get_db)):

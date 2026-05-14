@@ -150,3 +150,18 @@ class LabResult(Base):
     test_date = Column(String(20), nullable=False)
     status = Column(String(20), default="normal")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DemoRequest(Base):
+    __tablename__ = "demo_requests"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False)
+    clinic = Column(String(200), nullable=False)
+    email = Column(String(200), nullable=False)
+    phone = Column(String(50), nullable=False)
+    role = Column(String(100), nullable=False)
+    city = Column(String(120), nullable=True)
+    message = Column(Text, nullable=True)
+    source = Column(String(50), default="landing")
+    status = Column(String(50), default="new")
+    created_at = Column(DateTime, default=datetime.utcnow)
