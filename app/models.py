@@ -29,6 +29,7 @@ class Patient(Base):
     __tablename__ = "patients"
     id            = Column(Integer, primary_key=True)
     clinic_id     = Column(Integer, ForeignKey("clinics.id"), nullable=False)
+    mrn           = Column(String, unique=True, nullable=True)
     name          = Column(String, nullable=False)
     phone         = Column(String, nullable=False)
     condition     = Column(String)
@@ -46,6 +47,8 @@ class Patient(Base):
     last_visit_at = Column(Date)
     preferred_language = Column(String, default="en")
     opted_out     = Column(Boolean, default=False)
+    reminder_enabled = Column(Boolean, default=True)
+    followup_enabled = Column(Boolean, default=True)
     created_at    = Column(DateTime, default=datetime.utcnow)
     clinic        = relationship("Clinic", back_populates="patients")
     visits        = relationship("Visit", back_populates="patient")

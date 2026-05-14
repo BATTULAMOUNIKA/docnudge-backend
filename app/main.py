@@ -64,6 +64,18 @@ def _phone_local(value: str | None) -> str:
     digits = _digits_only(value)
     return digits[-10:] if len(digits) >= 10 else digits
 
+def _patient_mrn_value(clinic_id: int | None, patient_id: int | None) -> str | None:
+    if clinic_id is None or patient_id is None:
+        return None
+    return f"DN{int(clinic_id):03d}{int(patient_id):06d}"
+
+def _ensure_patient_mrn(db: Session, patient: Patient) -> str | None:
+    if patient.mrn:
+        return patient.mrn
+    patient.mrn = _patient_mrn_value(patient.clinic_id, patient.id)
+    db.flush()
+    return patient.mrn
+
 def clinic_out(clinic: Clinic) -> dict:
     billing_status = clinic.billing_status or "trialing"
     subscription_plan = clinic.subscription_plan or "trial"
@@ -99,9 +111,11 @@ def clinic_out(clinic: Clinic) -> dict:
     }
 
 def patient_out(patient: Patient) -> dict:
+    clinic = patient.clinic
     return {
         "id": patient.id,
         "clinic_id": patient.clinic_id,
+        "mrn": patient.mrn or _patient_mrn_value(patient.clinic_id, patient.id),
         "name": patient.name,
         "phone": patient.phone,
         "condition": patient.condition,
@@ -119,6 +133,9 @@ def patient_out(patient: Patient) -> dict:
         "last_visit_at": _dt(patient.last_visit_at),
         "preferred_language": patient.preferred_language or "en",
         "opted_out": bool(patient.opted_out),
+        "reminder_enabled": bool(patient.reminder_enabled),
+        "followup_enabled": bool(patient.followup_enabled),
+        "doctor_name": clinic.doctor_name if clinic else None,
         "created_at": _dt(patient.created_at),
     }
 
@@ -295,9 +312,15 @@ def run_migrations():
                 _add_column_if_missing(conn, "patients", "source", "VARCHAR DEFAULT 'walk_in'")
                 _add_column_if_missing(conn, "patients", "last_visit_at", "DATE")
                 _add_column_if_missing(conn, "patients", "preferred_language", "VARCHAR DEFAULT 'en'")
+                _add_column_if_missing(conn, "patients", "mrn", "VARCHAR")
+                _add_column_if_missing(conn, "patients", "reminder_enabled", "BOOLEAN DEFAULT TRUE")
+                _add_column_if_missing(conn, "patients", "followup_enabled", "BOOLEAN DEFAULT TRUE")
                 conn.execute(text("UPDATE patients SET opted_out = FALSE WHERE opted_out IS NULL"))
                 conn.execute(text("UPDATE patients SET source = 'walk_in' WHERE source IS NULL"))
                 conn.execute(text("UPDATE patients SET preferred_language = 'en' WHERE preferred_language IS NULL"))
+                conn.execute(text("UPDATE patients SET reminder_enabled = TRUE WHERE reminder_enabled IS NULL"))
+                conn.execute(text("UPDATE patients SET followup_enabled = TRUE WHERE followup_enabled IS NULL"))
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_patients_mrn ON patients (mrn)"))
 
             if "visits" in tables:
                 _add_column_if_missing(conn, "visits", "condition", "VARCHAR")
@@ -349,6 +372,31 @@ def run_migrations():
         logging.exception("Migration error")
 
 run_migrations()
+
+def backfill_patient_metadata():
+    db = SessionLocal()
+    try:
+        changed = False
+        for patient in db.query(Patient).all():
+            next_mrn = _patient_mrn_value(patient.clinic_id, patient.id)
+            if next_mrn and patient.mrn != next_mrn:
+                patient.mrn = next_mrn
+                changed = True
+            if patient.reminder_enabled is None:
+                patient.reminder_enabled = True
+                changed = True
+            if patient.followup_enabled is None:
+                patient.followup_enabled = True
+                changed = True
+        if changed:
+            db.commit()
+    except Exception:
+        db.rollback()
+        logging.exception("Could not backfill patient metadata")
+    finally:
+        db.close()
+
+backfill_patient_metadata()
 
 # ── Seed admin ─────────────────────────────────────────────
 def seed_admin():
@@ -407,6 +455,8 @@ class PatientIn(BaseModel):
     followup_type: str | None = None
     source:        str | None = "walk_in"
     preferred_language: str | None = "en"
+    reminder_enabled: bool | None = True
+    followup_enabled: bool | None = True
 
 class PatientUpdateIn(BaseModel):
     name: str | None = None
@@ -417,6 +467,8 @@ class PatientUpdateIn(BaseModel):
     followup_type: str | None = None
     source: str | None = None
     preferred_language: str | None = None
+    reminder_enabled: bool | None = None
+    followup_enabled: bool | None = None
 
 class VisitIn(BaseModel):
     patient_id: int
@@ -1107,9 +1159,12 @@ def complete_appointment(
                 condition=(data.condition if data else None) or appointment.service_type,
                 source="appointment",
                 preferred_language="en",
+                reminder_enabled=True,
+                followup_enabled=True,
             )
             db.add(patient)
             db.flush()
+            _ensure_patient_mrn(db, patient)
         elif data and data.condition:
             patient.condition = data.condition
 
@@ -2223,6 +2278,8 @@ def retention_send_reminder(
         patient = _patient_for_user(visit.patient_id, user, db)
         if patient.opted_out:
             raise HTTPException(status_code=400, detail="Patient has opted out")
+        if not patient.reminder_enabled or not patient.followup_enabled:
+            raise HTTPException(status_code=400, detail="Reminders are disabled for this patient")
 
         from app.whatsapp import send_whatsapp_message
 
@@ -2246,6 +2303,10 @@ def retention_send_reminder(
 def add_patient(data: PatientIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     try:
         require_clinic_access(data.clinic_id, user)
+        followup_enabled = True if data.followup_enabled is None else bool(data.followup_enabled)
+        reminder_enabled = bool(data.reminder_enabled) if data.reminder_enabled is not None else True
+        if not followup_enabled:
+            reminder_enabled = False
         patient = Patient(
             clinic_id=data.clinic_id,
             name=data.name,
@@ -2256,8 +2317,12 @@ def add_patient(data: PatientIn, user: User = Depends(get_current_user), db: Ses
             followup_type=data.followup_type,
             source=data.source or "walk_in",
             preferred_language=data.preferred_language or "en",
+            reminder_enabled=reminder_enabled,
+            followup_enabled=followup_enabled,
         )
         db.add(patient)
+        db.flush()
+        _ensure_patient_mrn(db, patient)
         db.commit()
         db.refresh(patient)
         return patient_out(patient)
@@ -2288,8 +2353,11 @@ def update_patient(
         raise HTTPException(status_code=404, detail="Patient not found")
     require_clinic_access(patient.clinic_id, user)
     payload = _model_data(data, exclude_unset=True)
+    if payload.get("followup_enabled") is False:
+        payload["reminder_enabled"] = False
     for field, value in payload.items():
         setattr(patient, field, value)
+    _ensure_patient_mrn(db, patient)
     db.commit()
     db.refresh(patient)
     return patient_out(patient)
@@ -2330,6 +2398,7 @@ def list_patients(
             query = query.filter(
                 or_(
                     Patient.name.ilike(like),
+                    Patient.mrn.ilike(like),
                     Patient.phone.ilike(like),
                     Patient.condition.ilike(like),
                     Patient.followup_type.ilike(like),
@@ -2518,6 +2587,8 @@ def send_recovery_message(
     require_clinic_access(patient.clinic_id, current_user)
     if patient.opted_out:
         raise HTTPException(status_code=400, detail="Patient has opted out")
+    if not patient.reminder_enabled or not patient.followup_enabled:
+        raise HTTPException(status_code=400, detail="Reminders are disabled for this patient")
 
     visit = (
         db.query(Visit)

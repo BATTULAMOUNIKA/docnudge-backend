@@ -15,6 +15,8 @@ def get_patients_for_reminder(db: Session, target_date: date):
         .filter(or_(Visit.followup_date == target_date, Visit.next_visit == target_date))
         .filter(or_(Visit.followup_status.in_(["due", "upcoming"]), Visit.followup_status.is_(None)))
         .filter(Patient.opted_out == False)
+        .filter(Patient.reminder_enabled == True)
+        .filter(Patient.followup_enabled == True)
         .all()
     )
 
@@ -117,6 +119,8 @@ def trigger_missed_followups():
             .filter(or_(Visit.followup_date == target_date, Visit.next_visit == target_date))
             .filter(or_(Visit.followup_status == "missed", Visit.status == "missed"))
             .filter(Patient.opted_out == False)
+            .filter(Patient.reminder_enabled == True)
+            .filter(Patient.followup_enabled == True)
             .all()
         )
         for patient, visit in rows:
