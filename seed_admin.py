@@ -6,12 +6,16 @@ Base.metadata.create_all(bind=engine)
 
 db = SessionLocal()
 
-existing = db.query(User).filter(User.email == "admin@clinicremind.in").first()
+existing = db.query(User).filter((User.login_id == "admin@clinicremind.in") | (User.email == "admin@clinicremind.in")).first()
 if existing:
+    if not existing.login_id:
+        existing.login_id = "admin@clinicremind.in"
+        db.commit()
     print("Admin already exists:", existing.email)
 else:
     admin = User(
         email="admin@clinicremind.in",
+        login_id="admin@clinicremind.in",
         password=hash_password("changeme123"),
         role="admin",
         clinic_id=None,

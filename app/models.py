@@ -83,7 +83,8 @@ class ReminderLog(Base):
 class User(Base):
     __tablename__ = "users"
     id         = Column(Integer, primary_key=True)
-    email      = Column(String, unique=True, nullable=False)
+    email      = Column(String, nullable=False)
+    login_id   = Column(String, unique=True, nullable=True)
     password   = Column(String, nullable=False)
     name       = Column(String)
     phone      = Column(String)

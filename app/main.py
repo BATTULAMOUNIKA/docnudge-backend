@@ -44,12 +44,14 @@ import json
 import logging
 import os
 import random
+import re
 import uuid
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="Clinic Reminder Engine")
 
-DUPLICATE_DOCTOR_EMAIL_MESSAGE = "This login email is already assigned to another account. Please use a different email for each doctor login."
+DUPLICATE_LOGIN_ID_MESSAGE = "This login ID is already assigned to another account. Please choose a different login ID."
+AMBIGUOUS_SHARED_EMAIL_LOGIN_MESSAGE = "Multiple accounts share this email. Please sign in with your unique login ID instead."
 
 def _dt(value):
     return value.isoformat() if value else None
@@ -59,13 +61,34 @@ def _model_data(model: BaseModel, exclude_unset: bool = False) -> dict:
         return model.model_dump(exclude_unset=exclude_unset)
     return model.dict(exclude_unset=exclude_unset)
 
-def _is_duplicate_user_email_error(error: Exception) -> bool:
+def _is_duplicate_user_login_id_error(error: Exception) -> bool:
     message = str(error).lower()
     return (
-        "email already exists" in message
+        "login id already exists" in message
         or "unique constraint failed" in message
-        or "users.email" in message
+        or "users.login_id" in message
+        or "ix_users_login_id" in message
     )
+
+def _slug_login_fragment(value: str | None) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", ".", str(value or "").strip().lower())
+    cleaned = re.sub(r"\.+", ".", cleaned).strip(".")
+    return cleaned
+
+def _default_login_id(email: str | None, name: str | None, role: str | None) -> str:
+    if email:
+        return str(email).strip().lower()
+    name_slug = _slug_login_fragment(name)
+    if name_slug:
+        return name_slug
+    role_slug = _slug_login_fragment(role)
+    return role_slug or f"user.{uuid.uuid4().hex[:8]}"
+
+def _normalize_login_id(value: str | None, email: str | None, name: str | None, role: str | None) -> str:
+    candidate = str(value or "").strip().lower()
+    if candidate:
+        return candidate
+    return _default_login_id(email, name, role)
 
 def _digits_only(value: str | None) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
@@ -194,6 +217,7 @@ def user_out(user: User) -> dict:
     return {
         "id": user.id,
         "email": user.email,
+        "login_id": user.login_id or user.email,
         "name": user.name,
         "phone": user.phone,
         "designation": user.designation,
@@ -320,6 +344,63 @@ def _drop_column_if_present(conn, table_name: str, column_name: str):
         except Exception:
             logging.exception("Could not drop legacy column %s.%s", table_name, column_name)
 
+def _drop_users_email_unique_constraints(conn):
+    inspector = inspect(conn)
+    dialect = conn.dialect.name
+
+    if dialect == "sqlite":
+        return
+
+    for constraint in inspector.get_unique_constraints("users"):
+        columns = constraint.get("column_names") or []
+        name = constraint.get("name")
+        if columns == ["email"] and name:
+            conn.execute(text(f'ALTER TABLE users DROP CONSTRAINT IF EXISTS "{name}"'))
+
+    for index in inspector.get_indexes("users"):
+        columns = index.get("column_names") or []
+        name = index.get("name")
+        if index.get("unique") and columns == ["email"] and name:
+            conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+
+def _rebuild_sqlite_users_for_shared_email(conn):
+    columns = _columns_for(conn, "users")
+    login_id_select = "login_id" if "login_id" in columns else "email"
+
+    conn.execute(text("PRAGMA foreign_keys=OFF"))
+    conn.execute(text("DROP TABLE IF EXISTS users__new"))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS users__new (
+            id INTEGER PRIMARY KEY,
+            email VARCHAR NOT NULL,
+            login_id VARCHAR,
+            password VARCHAR NOT NULL,
+            name VARCHAR,
+            phone VARCHAR,
+            designation VARCHAR,
+            role VARCHAR,
+            clinic_id INTEGER,
+            created_at DATETIME
+        )
+    """))
+    conn.execute(text(f"""
+        INSERT INTO users__new (id, email, login_id, password, name, phone, designation, role, clinic_id, created_at)
+        SELECT id, email, COALESCE({login_id_select}, email), password, name, phone, designation, role, clinic_id, created_at
+        FROM users
+    """))
+    conn.execute(text("DROP TABLE users"))
+    conn.execute(text("ALTER TABLE users__new RENAME TO users"))
+    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_login_id ON users (login_id)"))
+    conn.execute(text("PRAGMA foreign_keys=ON"))
+
+def _sqlite_users_need_rebuild(conn) -> bool:
+    columns = _columns_for(conn, "users")
+    if "login_id" not in columns:
+        return True
+    row = conn.execute(text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")).fetchone()
+    create_sql = ((row[0] if row else "") or "").upper().replace('"', "").replace("`", "")
+    return "EMAIL VARCHAR NOT NULL UNIQUE" in create_sql
+
 def run_migrations():
     try:
         with engine.begin() as conn:
@@ -410,9 +491,20 @@ def run_migrations():
                 conn.execute(text("UPDATE clinics SET widget_enabled = TRUE WHERE widget_enabled IS NULL"))
 
             if "users" in tables:
+                if conn.dialect.name == "sqlite" and _sqlite_users_need_rebuild(conn):
+                    _rebuild_sqlite_users_for_shared_email(conn)
+                else:
+                    _add_column_if_missing(conn, "users", "login_id", "VARCHAR")
+                    conn.execute(text("UPDATE users SET login_id = email WHERE login_id IS NULL"))
+                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_login_id ON users (login_id)"))
+                    _drop_users_email_unique_constraints(conn)
+
                 _add_column_if_missing(conn, "users", "name", "VARCHAR")
+                _add_column_if_missing(conn, "users", "login_id", "VARCHAR")
                 _add_column_if_missing(conn, "users", "phone", "VARCHAR")
                 _add_column_if_missing(conn, "users", "designation", "VARCHAR")
+                conn.execute(text("UPDATE users SET login_id = email WHERE login_id IS NULL"))
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_login_id ON users (login_id)"))
                 conn.execute(text("""
                     UPDATE users
                     SET designation = clinics.designation
@@ -446,8 +538,12 @@ def backfill_patient_metadata():
         clinics_by_id = {clinic.id: clinic for clinic in db.query(Clinic).all()}
         for user in db.query(User).all():
             clinic = clinics_by_id.get(user.clinic_id)
+            if not user.login_id:
+                user.login_id = user.email
+                changed = True
             if not user.name and user.role == "doctor":
-                user.name = clinic.doctor_name if clinic and clinic.doctor_name else user.email.split("@")[0].replace(".", " ").title()
+                fallback_id = user.login_id or user.email or "doctor"
+                user.name = clinic.doctor_name if clinic and clinic.doctor_name else fallback_id.split("@")[0].replace(".", " ").title()
                 changed = True
             if not user.designation and clinic and clinic.designation:
                 user.designation = clinic.designation
@@ -495,10 +591,11 @@ def seed_admin():
             "on",
         }
 
-        existing = db.query(User).filter(User.email == admin_email).first()
+        existing = db.query(User).filter(or_(User.login_id == admin_email, User.email == admin_email)).first()
         if not existing:
             admin = User(
                 email=admin_email,
+                login_id=admin_email,
                 password=hash_password(admin_password),
                 role="admin",
                 clinic_id=None,
@@ -508,6 +605,11 @@ def seed_admin():
             print("Admin seeded successfully.")
         elif reset_password:
             existing.password = hash_password(admin_password)
+            if not existing.login_id:
+                existing.login_id = admin_email
+            db.commit()
+        elif not existing.login_id:
+            existing.login_id = admin_email
             db.commit()
             print("Admin password reset from environment.")
         else:
@@ -567,6 +669,7 @@ class VisitIn(BaseModel):
 
 class UserIn(BaseModel):
     email:     str
+    login_id:  str | None = None
     password:  str
     name:      str | None = None
     phone:     str | None = None
@@ -577,6 +680,7 @@ class UserIn(BaseModel):
 
 class UserUpdateIn(BaseModel):
     email: str | None = None
+    login_id: str | None = None
     password: str | None = None
     name: str | None = None
     phone: str | None = None
@@ -808,9 +912,16 @@ def root():
 @app.post("/auth/login")
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     try:
-        user = db.query(User).filter(User.email == form.username).first()
+        identifier = (form.username or "").strip().lower()
+        user = db.query(User).filter(User.login_id == identifier).first()
+        if not user:
+            email_matches = db.query(User).filter(User.email == identifier).all()
+            if len(email_matches) == 1:
+                user = email_matches[0]
+            elif len(email_matches) > 1:
+                raise HTTPException(status_code=401, detail=AMBIGUOUS_SHARED_EMAIL_LOGIN_MESSAGE)
         if not user or not verify_password(form.password, user.password):
-            raise HTTPException(status_code=401, detail="Invalid email or password")
+            raise HTTPException(status_code=401, detail="Invalid login ID, email, or password")
         clinic = db.query(Clinic).filter(Clinic.id == user.clinic_id).first() if user.clinic_id else None
         doctor_name = _doctor_name_for_user(user, clinic)
         designation = _designation_for_user(user, clinic)
@@ -829,6 +940,8 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
             "token_type": "bearer",
             "role": user.role,
             "clinic_id": user.clinic_id,
+            "login_id": user.login_id or user.email,
+            "email": user.email,
             "clinic_name": clinic.name if clinic else None,
             "doctor_name": doctor_name,
             "designation": designation,
@@ -967,10 +1080,12 @@ def list_demo_requests(db: Session = Depends(get_db)):
 @app.post("/admin/users", dependencies=[Depends(require_admin)])
 def create_user(data: UserIn, db: Session = Depends(get_db)):
     try:
-        if db.query(User).filter(User.email == data.email).first():
-            raise HTTPException(status_code=400, detail=DUPLICATE_DOCTOR_EMAIL_MESSAGE)
+        login_id = _normalize_login_id(data.login_id, data.email, data.name, data.role)
+        if db.query(User).filter(User.login_id == login_id).first():
+            raise HTTPException(status_code=400, detail=DUPLICATE_LOGIN_ID_MESSAGE)
         user = User(
             email=data.email,
+            login_id=login_id,
             password=hash_password(data.password),
             name=data.name,
             phone=data.phone,
@@ -985,8 +1100,8 @@ def create_user(data: UserIn, db: Session = Depends(get_db)):
     except HTTPException:
         raise
     except Exception as e:
-        if _is_duplicate_user_email_error(e):
-            raise HTTPException(status_code=400, detail=DUPLICATE_DOCTOR_EMAIL_MESSAGE)
+        if _is_duplicate_user_login_id_error(e):
+            raise HTTPException(status_code=400, detail=DUPLICATE_LOGIN_ID_MESSAGE)
         logging.exception("create_user failed")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1001,17 +1116,23 @@ def update_user(user_id: int, data: UserUpdateIn, db: Session = Depends(get_db))
             raise HTTPException(status_code=400, detail="Only doctor accounts can be edited here")
         if data.role is not None and data.role != "doctor":
             raise HTTPException(status_code=400, detail="Doctor accounts must keep the doctor role")
-        if data.email:
-            existing = db.query(User).filter(User.email == data.email, User.id != user_id).first()
+
+        next_login_id = None
+        if data.login_id is not None:
+            next_login_id = _normalize_login_id(data.login_id, data.email or user.email, data.name or user.name, user.role)
+            existing = db.query(User).filter(User.login_id == next_login_id, User.id != user_id).first()
             if existing:
-                raise HTTPException(status_code=400, detail=DUPLICATE_DOCTOR_EMAIL_MESSAGE)
+                raise HTTPException(status_code=400, detail=DUPLICATE_LOGIN_ID_MESSAGE)
 
         payload = _model_data(data, exclude_unset=True)
         next_password = payload.pop("password", None)
         payload.pop("role", None)
+        payload.pop("login_id", None)
 
         for field, value in payload.items():
             setattr(user, field, value)
+        if next_login_id:
+            user.login_id = next_login_id
         if next_password:
             user.password = hash_password(next_password)
 
@@ -1022,8 +1143,8 @@ def update_user(user_id: int, data: UserUpdateIn, db: Session = Depends(get_db))
         raise
     except Exception as e:
         db.rollback()
-        if _is_duplicate_user_email_error(e):
-            raise HTTPException(status_code=400, detail=DUPLICATE_DOCTOR_EMAIL_MESSAGE)
+        if _is_duplicate_user_login_id_error(e):
+            raise HTTPException(status_code=400, detail=DUPLICATE_LOGIN_ID_MESSAGE)
         logging.exception("update_user failed")
         raise HTTPException(status_code=500, detail=str(e))
 
