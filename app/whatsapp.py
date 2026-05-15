@@ -4,9 +4,8 @@ from datetime import date, datetime
 from urllib import error, request
 
 from app.config import (
-    INTERAKT_API_KEY,
-    INTERAKT_BASE_URL,
-    INTERAKT_CAMPAIGN_ID,
+    WHATSAPP_ACCESS_TOKEN,
+    WHATSAPP_PHONE_NUMBER_ID,
     INTERAKT_LANGUAGE_CODE,
     INTERAKT_TEMPLATE_DAY_BEFORE,
     INTERAKT_TEMPLATE_MISSED_FOLLOWUP,
@@ -20,6 +19,8 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLINIC_NAME = "your clinic"
+META_API_VERSION = "v20.0"
+META_API_BASE = f"https://graph.facebook.com/{META_API_VERSION}"
 
 TEMPLATE_BY_MESSAGE_TYPE = {
     "thank_you": INTERAKT_TEMPLATE_THANK_YOU,
@@ -31,8 +32,20 @@ TEMPLATE_BY_MESSAGE_TYPE = {
 }
 
 
+# ── Phone helpers ───────────────────────────────────────────
+
 def _digits_only(value: str | None) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _to_e164(phone: str) -> str:
+    """Return full international digits (no + or spaces) for Meta API."""
+    digits = _digits_only(phone)
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if len(digits) == 10:
+        return f"91{digits}"
+    return digits
 
 
 def split_country_code(phone: str) -> tuple[str, str]:
@@ -47,6 +60,8 @@ def split_country_code(phone: str) -> tuple[str, str]:
         return f"+{digits[:-10]}", digits[-10:]
     return "+91", digits
 
+
+# ── Date / context helpers ──────────────────────────────────
 
 def _format_date(value) -> str:
     if not value:
@@ -101,74 +116,123 @@ def _body_values_for(message_type: str, patient_name: str, context: dict | None 
             context.get("summary", "No action needed."),
         ],
     }
-    return [str(value) for value in values_by_type.get(message_type, [patient_name, clinic_name, next_visit])]
+    return [str(v) for v in values_by_type.get(message_type, [patient_name, clinic_name, next_visit])]
 
 
-def send_interakt_template(
-    phone: str,
-    template_name: str,
-    body_values: list[str],
-    callback_data: str | None = None,
-) -> dict:
-    if not INTERAKT_API_KEY:
-        return {"error": "INTERAKT_API_KEY is not configured", "provider": "interakt"}
-    if not template_name:
-        return {"error": "Interakt template name is not configured", "provider": "interakt"}
+# ── Meta Graph API core ─────────────────────────────────────
 
-    country_code, phone_number = split_country_code(phone)
-    if not phone_number:
-        return {"error": "Phone number is empty", "provider": "interakt"}
+def _meta_post(payload: dict) -> dict:
+    """POST a message payload to Meta's messages endpoint."""
+    if not WHATSAPP_ACCESS_TOKEN:
+        return {"error": "WHATSAPP_ACCESS_TOKEN is not configured", "provider": "meta"}
+    if not WHATSAPP_PHONE_NUMBER_ID:
+        return {"error": "WHATSAPP_PHONE_NUMBER_ID is not configured", "provider": "meta"}
 
-    payload = {
-        "countryCode": country_code,
-        "phoneNumber": phone_number,
-        "type": "Template",
-        "template": {
-            "name": template_name,
-            "languageCode": INTERAKT_LANGUAGE_CODE,
-            "bodyValues": body_values,
-        },
-    }
-    if callback_data:
-        payload["callbackData"] = callback_data[:512]
-    if INTERAKT_CAMPAIGN_ID:
-        payload["campaignId"] = INTERAKT_CAMPAIGN_ID
-
-    url = f"{INTERAKT_BASE_URL.rstrip('/')}/v1/public/message/"
+    url = f"{META_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     body = json.dumps(payload).encode("utf-8")
     req = request.Request(
         url,
         data=body,
         method="POST",
         headers={
-            "Authorization": f"Basic {INTERAKT_API_KEY}",
+            "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
             "Content-Type": "application/json",
         },
     )
 
     try:
-        with request.urlopen(req, timeout=INTERAKT_TIMEOUT_SECONDS) as response:
-            raw = response.read().decode("utf-8")
+        with request.urlopen(req, timeout=INTERAKT_TIMEOUT_SECONDS) as resp:
+            raw = resp.read().decode("utf-8")
             data = json.loads(raw) if raw else {}
     except error.HTTPError as exc:
-        response_body = exc.read().decode("utf-8", errors="replace")
-        logger.warning("Interakt send failed: %s %s", exc.code, response_body)
-        return {"error": f"Interakt API {exc.code}: {response_body}", "provider": "interakt"}
+        body_text = exc.read().decode("utf-8", errors="replace")
+        logger.warning("Meta send failed: %s %s", exc.code, body_text)
+        return {"error": f"Meta API {exc.code}: {body_text}", "provider": "meta"}
     except Exception as exc:
-        logger.exception("Interakt send failed")
-        return {"error": str(exc), "provider": "interakt"}
+        logger.exception("Meta send failed")
+        return {"error": str(exc), "provider": "meta"}
 
-    if data.get("result") is False:
-        return {"error": data.get("message") or "Interakt rejected the message", "provider": "interakt"}
+    msg_id = None
+    try:
+        msg_id = data["messages"][0]["id"]
+    except (KeyError, IndexError, TypeError):
+        pass
 
     return {
-        "id": data.get("id"),
-        "status": data.get("message") or "queued",
-        "mode": "template",
-        "provider": "interakt",
-        "template": template_name,
+        "id": msg_id,
+        "status": "queued" if msg_id else "unknown",
+        "provider": "meta",
+        "raw": data,
     }
 
+
+def send_meta_template(
+    phone: str,
+    template_name: str,
+    body_values: list[str],
+    language: str | None = None,
+) -> dict:
+    """Send a WhatsApp template message via Meta Graph API."""
+    if not template_name:
+        return {"error": "Template name is not configured", "provider": "meta"}
+
+    to = _to_e164(phone)
+    if not to:
+        return {"error": "Phone number is empty", "provider": "meta"}
+
+    lang = language or INTERAKT_LANGUAGE_CODE or "en"
+
+    components = []
+    if body_values:
+        components.append({
+            "type": "body",
+            "parameters": [{"type": "text", "text": str(v)} for v in body_values],
+        })
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": lang},
+            "components": components,
+        },
+    }
+    result = _meta_post(payload)
+    result["template"] = template_name
+    result["mode"] = "template"
+    return result
+
+
+def send_meta_text(phone: str, text: str) -> dict:
+    """Send a free-form text message (only works within the 24-hour service window)."""
+    to = _to_e164(phone)
+    if not to:
+        return {"error": "Phone number is empty", "provider": "meta"}
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text},
+    }
+    result = _meta_post(payload)
+    result["mode"] = "text"
+    return result
+
+
+def send_hello_world(phone: str) -> dict:
+    """Send the pre-approved hello_world template — use for connectivity testing."""
+    return send_meta_template(
+        phone=phone,
+        template_name="hello_world",
+        body_values=[],
+        language="en_US",
+    )
+
+
+# ── Public API (same signatures as before) ──────────────────
 
 def send_whatsapp_message(
     phone: str,
@@ -178,11 +242,10 @@ def send_whatsapp_message(
 ) -> dict:
     template_name = TEMPLATE_BY_MESSAGE_TYPE.get(reminder_type)
     body_values = _body_values_for(reminder_type, patient_name, context)
-    return send_interakt_template(
+    return send_meta_template(
         phone=phone,
         template_name=template_name,
         body_values=body_values,
-        callback_data=f"docnudge:{reminder_type}",
     )
 
 

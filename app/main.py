@@ -3127,3 +3127,10 @@ async def receive_whatsapp_webhook(request: Request, db: Session = Depends(get_d
             db.commit()
         return {"status": "received", "action": "opt_out", "matched": len(patients)}
     return {"status": "received", "action": "ignored"}
+
+
+# ── WhatsApp test endpoint ──────────────────────────────────
+@app.post("/test/whatsapp-hello")
+def test_whatsapp_hello(phone: str, user: User = Depends(require_admin)):
+    from app.whatsapp import send_hello_world
+    return send_hello_world(phone)
