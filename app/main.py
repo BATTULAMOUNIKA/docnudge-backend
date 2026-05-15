@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, Request, Query, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, PlainTextResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, or_, text
@@ -3098,3 +3098,32 @@ def test_morning(user: User = Depends(require_admin)):
 def test_missed_followups(user: User = Depends(require_admin)):
     trigger_missed_followups()
     return {"status": "missed follow-up messages triggered"}
+
+
+# ── WhatsApp webhook (Meta verification) ───────────────────
+@app.get("/webhooks/whatsapp")
+def verify_whatsapp_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+):
+    if hub_mode == "subscribe" and hub_verify_token == WEBHOOK_VERIFY_TOKEN:
+        return PlainTextResponse(content=hub_challenge)
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/webhooks/whatsapp")
+async def receive_whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
+    from app.whatsapp import handle_opt_out
+
+    data = await request.json()
+    logging.info("WhatsApp webhook received: %s", data)
+    phone, body = _extract_inbound_message(data)
+    if phone and body and handle_opt_out(body):
+        patients = db.query(Patient).filter(_phone_match_filter(phone)).all()
+        for patient in patients:
+            patient.opted_out = True
+        if patients:
+            db.commit()
+        return {"status": "received", "action": "opt_out", "matched": len(patients)}
+    return {"status": "received", "action": "ignored"}
