@@ -30,7 +30,7 @@ from app.auth import (
     require_admin,
     require_clinic_access,
 )
-from app.config import WEBHOOK_VERIFY_TOKEN
+from app.config import WEBHOOK_VERIFY_TOKEN, PATIENT_PORTAL_URL
 from app.ai_helpers import (
     parse_prescription_shorthand,
     check_drug_interactions,
@@ -520,6 +520,9 @@ def run_migrations():
                 _add_column_if_missing(conn, "demo_requests", "status", "VARCHAR DEFAULT 'new'")
                 conn.execute(text("UPDATE demo_requests SET source = 'landing' WHERE source IS NULL"))
                 conn.execute(text("UPDATE demo_requests SET status = 'new' WHERE status IS NULL"))
+
+            if "prescriptions" in tables:
+                _add_column_if_missing(conn, "prescriptions", "share_token", "TEXT")
 
             if "patients" in tables:
                 logging.info("patients columns after migration: %s", sorted(_columns_for(conn, "patients")))
@@ -2890,16 +2893,129 @@ def get_visits_by_clinic(clinic_id: int, user: User = Depends(get_current_user),
 
 
 @app.post("/prescriptions")
-def create_prescription(data: PrescriptionCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def create_prescription(
+    data: PrescriptionCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     patient = db.query(Patient).filter(Patient.id == data.patient_id).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
     require_clinic_access(patient.clinic_id, current_user)
-    rx = Prescription(patient_id=data.patient_id, medicines=[_model_data(m) for m in data.medicines], notes=data.notes or "")
+
+    # Secure UUID token — never exposes raw DB id to patients
+    share_token = uuid.uuid4().hex
+
+    rx = Prescription(
+        patient_id=data.patient_id,
+        medicines=[_model_data(m) for m in data.medicines],
+        notes=data.notes or "",
+        share_token=share_token,
+    )
     db.add(rx)
     db.commit()
     db.refresh(rx)
-    return rx
+
+    prescription_link = f"{PATIENT_PORTAL_URL}/p/{share_token}"
+
+    # Auto WhatsApp — doctor does nothing extra
+    _auto_send_prescription_whatsapp(db, patient, rx, prescription_link)
+
+    return {**rx.__dict__, "prescription_link": prescription_link}
+
+
+def _auto_send_prescription_whatsapp(db, patient, rx, prescription_link: str):
+    """Fires silently after prescription saved. Never blocks the response."""
+    try:
+        if not patient.phone or patient.opted_out or not patient.reminder_enabled:
+            return
+
+        clinic = db.query(Clinic).filter(Clinic.id == patient.clinic_id).first()
+        clinic_name = clinic.name if clinic else "your clinic"
+
+        from app.whatsapp import send_prescription_whatsapp
+        result = send_prescription_whatsapp(
+            phone=patient.phone,
+            patient_name=patient.name,
+            clinic_name=clinic_name,
+            prescription_link=prescription_link,
+        )
+
+        log = ReminderLog(
+            patient_id=patient.id,
+            reminder_type="prescription",
+            success="error" not in result,
+            error=result.get("error"),
+        )
+        db.add(log)
+        db.commit()
+
+    except Exception:
+        logger.exception("Auto prescription WhatsApp failed for patient %s", patient.id)
+
+
+@app.get("/p/{share_token}")
+def view_prescription_by_token(share_token: str, db: Session = Depends(get_db)):
+    """
+    Public endpoint — no auth needed.
+    Patient opens from WhatsApp link: patient.docnudge.in/p/8fd2a1b9c4
+    """
+    rx = db.query(Prescription).filter(Prescription.share_token == share_token).first()
+    if not rx:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+    patient = db.query(Patient).filter(Patient.id == rx.patient_id).first()
+    clinic  = db.query(Clinic).filter(Clinic.id == patient.clinic_id).first() if patient else None
+    return _prescription_out(rx, patient, clinic)
+
+
+@app.get("/p/{share_token}/pdf")
+def download_prescription_pdf(share_token: str, db: Session = Depends(get_db)):
+    """
+    Returns PDF — patient can download, print, show at pharmacy.
+    URL: patient.docnudge.in/p/8fd2a1b9c4/pdf
+    """
+    from app.prescription_pdf import generate_prescription_pdf
+
+    rx = db.query(Prescription).filter(Prescription.share_token == share_token).first()
+    if not rx:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+
+    patient = db.query(Patient).filter(Patient.id == rx.patient_id).first()
+    clinic  = db.query(Clinic).filter(Clinic.id == patient.clinic_id).first() if patient else None
+
+    latest_visit = (
+        db.query(Visit)
+        .filter(Visit.patient_id == rx.patient_id)
+        .order_by(Visit.id.desc())
+        .first()
+    )
+    next_visit = None
+    if latest_visit:
+        nv = latest_visit.followup_date or latest_visit.next_visit
+        if nv:
+            next_visit = str(nv)
+
+    pdf_bytes = generate_prescription_pdf(
+        patient_name=patient.name if patient else "Patient",
+        patient_age=patient.age if patient else None,
+        patient_gender=patient.gender if patient else None,
+        clinic_name=clinic.name if clinic else "DocNudge Clinic",
+        doctor_name=clinic.doctor_name if clinic else None,
+        designation=clinic.designation if clinic else None,
+        clinic_phone=clinic.phone if clinic else None,
+        clinic_address=clinic.address if clinic else None,
+        condition=patient.condition if patient else None,
+        medicines=rx.medicines or [],
+        notes=rx.notes or "",
+        next_visit=next_visit,
+        visit_date=rx.created_at.strftime("%d %b %Y") if rx.created_at else None,
+    )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="prescription-{share_token[:8]}.pdf"'},
+    )
 
 
 @app.put("/prescriptions/{prescription_id}")

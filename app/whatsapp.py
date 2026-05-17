@@ -9,26 +9,25 @@ from app.config import (
     INTERAKT_LANGUAGE_CODE,
     INTERAKT_TEMPLATE_DAY_BEFORE,
     INTERAKT_TEMPLATE_MISSED_FOLLOWUP,
-    INTERAKT_TEMPLATE_MORNING,
-    INTERAKT_TEMPLATE_THANK_YOU,
-    INTERAKT_TEMPLATE_TWO_DAYS_BEFORE,
-    INTERAKT_TEMPLATE_WEEKLY_REPORT,
+    INTERAKT_TEMPLATE_PRESCRIPTION,
     INTERAKT_TIMEOUT_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLINIC_NAME = "your clinic"
-META_API_VERSION = "v20.0"
-META_API_BASE = f"https://graph.facebook.com/{META_API_VERSION}"
+META_API_VERSION    = "v20.0"
+META_API_BASE       = f"https://graph.facebook.com/{META_API_VERSION}"
+
+# ── Template registry (3 templates only) ───────────────────
+#   docnudge_prescription    → thank you + prescription link (fires after visit)
+#   docnudge_day_before      → reminder + clinic number + confirm/reschedule buttons
+#   docnudge_missed_followup → recovery message
 
 TEMPLATE_BY_MESSAGE_TYPE = {
-    "thank_you": INTERAKT_TEMPLATE_THANK_YOU,
-    "two_days_before": INTERAKT_TEMPLATE_TWO_DAYS_BEFORE,
-    "day_before": INTERAKT_TEMPLATE_DAY_BEFORE,
-    "morning": INTERAKT_TEMPLATE_MORNING,
+    "prescription":   INTERAKT_TEMPLATE_PRESCRIPTION,
+    "day_before":     INTERAKT_TEMPLATE_DAY_BEFORE,
     "missed_followup": INTERAKT_TEMPLATE_MISSED_FOLLOWUP,
-    "weekly_report": INTERAKT_TEMPLATE_WEEKLY_REPORT,
 }
 
 
@@ -39,7 +38,6 @@ def _digits_only(value: str | None) -> str:
 
 
 def _to_e164(phone: str) -> str:
-    """Return full international digits (no + or spaces) for Meta API."""
     digits = _digits_only(phone)
     if digits.startswith("00"):
         digits = digits[2:]
@@ -61,7 +59,7 @@ def split_country_code(phone: str) -> tuple[str, str]:
     return "+91", digits
 
 
-# ── Date / context helpers ──────────────────────────────────
+# ── Date helpers ────────────────────────────────────────────
 
 def _format_date(value) -> str:
     if not value:
@@ -91,58 +89,61 @@ def care_tip_for(condition: str | None) -> str:
     return "Follow the doctor's advice and keep your next visit."
 
 
-def _body_values_for(message_type: str, patient_name: str, context: dict | None = None) -> list[str]:
-    context = context or {}
-    clinic_name = context.get("clinic_name") or DEFAULT_CLINIC_NAME
-    condition = context.get("condition") or "Follow-up"
-    next_visit = _format_date(context.get("next_visit") or context.get("followup_date"))
-    care_tip = context.get("care_tip") or care_tip_for(condition)
-    appointment_time = context.get("appointment_time") or "your scheduled time"
-    clinic_address = context.get("clinic_address") or "the clinic"
+# ── Variable builders ───────────────────────────────────────
+
+def _body_values_for(
+    message_type: str,
+    patient_name: str,
+    context: dict | None = None,
+) -> list[str]:
+    context      = context or {}
+    clinic_name  = context.get("clinic_name") or DEFAULT_CLINIC_NAME
+    next_visit   = _format_date(context.get("next_visit") or context.get("followup_date"))
     clinic_phone = context.get("clinic_phone") or "the clinic"
+    rx_link      = context.get("prescription_link") or ""
+    missed_date  = _format_date(context.get("missed_date") or context.get("next_visit"))
 
     values_by_type = {
-        "thank_you": [patient_name, clinic_name, condition, next_visit, care_tip],
-        "two_days_before": [patient_name, clinic_name, next_visit, care_tip],
-        "day_before": [patient_name, clinic_name, next_visit],
-        "morning": [patient_name, appointment_time, clinic_address],
-        "missed_followup": [patient_name, clinic_name, next_visit, clinic_phone],
-        "weekly_report": [
-            clinic_name,
-            context.get("total_patients", "0"),
-            context.get("visits_completed", "0"),
-            context.get("missed_count", "0"),
-            context.get("return_rate", "0%"),
-            context.get("summary", "No action needed."),
-        ],
+        # docnudge_prescription
+        # {{1}} patient name | {{2}} clinic name | {{3}} prescription link
+        "prescription": [patient_name, clinic_name, rx_link],
+
+        # docnudge_day_before
+        # {{1}} patient name | {{2}} clinic name | {{3}} date | {{4}} clinic phone
+        "day_before": [patient_name, clinic_name, next_visit, clinic_phone],
+
+        # docnudge_missed_followup
+        # {{1}} patient name | {{2}} clinic name | {{3}} date | {{4}} clinic phone
+        "missed_followup": [patient_name, clinic_name, missed_date, clinic_phone],
     }
-    return [str(v) for v in values_by_type.get(message_type, [patient_name, clinic_name, next_visit])]
+    return [str(v) for v in values_by_type.get(
+        message_type, [patient_name, clinic_name, next_visit]
+    )]
 
 
 # ── Meta Graph API core ─────────────────────────────────────
 
 def _meta_post(payload: dict) -> dict:
-    """POST a message payload to Meta's messages endpoint."""
     if not WHATSAPP_ACCESS_TOKEN:
         return {"error": "WHATSAPP_ACCESS_TOKEN is not configured", "provider": "meta"}
     if not WHATSAPP_PHONE_NUMBER_ID:
         return {"error": "WHATSAPP_PHONE_NUMBER_ID is not configured", "provider": "meta"}
 
-    url = f"{META_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    url  = f"{META_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     body = json.dumps(payload).encode("utf-8")
-    req = request.Request(
+    req  = request.Request(
         url,
         data=body,
         method="POST",
         headers={
             "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
-            "Content-Type": "application/json",
+            "Content-Type":  "application/json",
         },
     )
 
     try:
         with request.urlopen(req, timeout=INTERAKT_TIMEOUT_SECONDS) as resp:
-            raw = resp.read().decode("utf-8")
+            raw  = resp.read().decode("utf-8")
             data = json.loads(raw) if raw else {}
     except error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", errors="replace")
@@ -159,10 +160,10 @@ def _meta_post(payload: dict) -> dict:
         pass
 
     return {
-        "id": msg_id,
-        "status": "queued" if msg_id else "unknown",
+        "id":       msg_id,
+        "status":   "queued" if msg_id else "unknown",
         "provider": "meta",
-        "raw": data,
+        "raw":      data,
     }
 
 
@@ -172,7 +173,6 @@ def send_meta_template(
     body_values: list[str],
     language: str | None = None,
 ) -> dict:
-    """Send a WhatsApp template message via Meta Graph API."""
     if not template_name:
         return {"error": "Template name is not configured", "provider": "meta"}
 
@@ -180,8 +180,7 @@ def send_meta_template(
     if not to:
         return {"error": "Phone number is empty", "provider": "meta"}
 
-    lang = language or INTERAKT_LANGUAGE_CODE or "en"
-
+    lang       = language or INTERAKT_LANGUAGE_CODE or "en"
     components = []
     if body_values:
         components.append({
@@ -191,48 +190,37 @@ def send_meta_template(
 
     payload = {
         "messaging_product": "whatsapp",
-        "to": to,
+        "to":   to,
         "type": "template",
         "template": {
-            "name": template_name,
-            "language": {"code": lang},
+            "name":       template_name,
+            "language":   {"code": lang},
             "components": components,
         },
     }
-    result = _meta_post(payload)
+    result             = _meta_post(payload)
     result["template"] = template_name
-    result["mode"] = "template"
+    result["mode"]     = "template"
     return result
 
 
 def send_meta_text(phone: str, text: str) -> dict:
-    """Send a free-form text message (only works within the 24-hour service window)."""
+    """Free-form text — only works within the 24-hour service window."""
     to = _to_e164(phone)
     if not to:
         return {"error": "Phone number is empty", "provider": "meta"}
-
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text},
-    }
-    result = _meta_post(payload)
+    payload        = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
+    result         = _meta_post(payload)
     result["mode"] = "text"
     return result
 
 
 def send_hello_world(phone: str) -> dict:
-    """Send the pre-approved hello_world template — use for connectivity testing."""
-    return send_meta_template(
-        phone=phone,
-        template_name="hello_world",
-        body_values=[],
-        language="en_US",
-    )
+    """Pre-approved hello_world template — connectivity test only."""
+    return send_meta_template(phone=phone, template_name="hello_world", body_values=[], language="en_US")
 
 
-# ── Public API (same signatures as before) ──────────────────
+# ── Public API ──────────────────────────────────────────────
 
 def send_whatsapp_message(
     phone: str,
@@ -240,31 +228,30 @@ def send_whatsapp_message(
     reminder_type: str,
     context: dict | None = None,
 ) -> dict:
+    """Main entry point — maps reminder_type → template → sends."""
     template_name = TEMPLATE_BY_MESSAGE_TYPE.get(reminder_type)
-    body_values = _body_values_for(reminder_type, patient_name, context)
-    return send_meta_template(
-        phone=phone,
-        template_name=template_name,
-        body_values=body_values,
-    )
+    body_values   = _body_values_for(reminder_type, patient_name, context)
+    return send_meta_template(phone=phone, template_name=template_name, body_values=body_values)
 
 
-def send_visit_thank_you_message(
+def send_prescription_whatsapp(
     phone: str,
     patient_name: str,
-    condition: str | None,
-    next_visit,
-    clinic_name: str | None = None,
+    clinic_name: str,
+    prescription_link: str,
 ) -> dict:
+    """
+    Sends docnudge_prescription template automatically after doctor saves prescription.
+    Template vars: {{1}} name | {{2}} clinic | {{3}} link
+    prescription_link → https://patient.docnudge.in/p/UUID
+    """
     return send_whatsapp_message(
         phone=phone,
         patient_name=patient_name,
-        reminder_type="thank_you",
+        reminder_type="prescription",
         context={
-            "clinic_name": clinic_name or DEFAULT_CLINIC_NAME,
-            "condition": condition,
-            "next_visit": next_visit,
-            "care_tip": care_tip_for(condition),
+            "clinic_name":       clinic_name,
+            "prescription_link": prescription_link,
         },
     )
 
@@ -273,18 +260,13 @@ def handle_opt_out(message: str) -> bool:
     return message.lower().strip() in {"stop", "unsubscribe", "cancel", "quit"}
 
 
-def build_prescription_message(patient, prescription):
-    lines = [
-        f"Hello {patient.name}!",
-        "Here is your prescription from today's visit:",
-        "",
-    ]
+def build_prescription_message(patient, prescription) -> str:
+    """Plain-text fallback only."""
+    lines = [f"Hello {patient.name}!", "Here is your prescription from today's visit:", ""]
     for m in prescription.medicines:
         lines.append(f"- {m.get('name', '')} - {m.get('dosage', '')}")
         lines.append(f"  Timing: {m.get('frequency', '')} | Duration: {m.get('duration', '')}")
     if prescription.notes:
-        lines.append("")
-        lines.append(f"Notes: {prescription.notes}")
-    lines.append("")
-    lines.append("Take care and get well soon.")
+        lines += ["", f"Notes: {prescription.notes}"]
+    lines += ["", "Take care and get well soon."]
     return "\n".join(lines)

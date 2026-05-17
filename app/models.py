@@ -146,6 +146,7 @@ class Prescription(Base):
     patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False)
     medicines = Column(JSON, nullable=False)
     notes = Column(Text, default="")
+    share_token = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

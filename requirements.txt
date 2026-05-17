@@ -9,3 +9,4 @@ alembic
 PyJWT>=2.8.0
 passlib[bcrypt]
 bcrypt==4.0.1
+reportlab
