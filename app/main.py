@@ -48,6 +48,7 @@ import re
 import uuid
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 app = FastAPI(title="Clinic Reminder Engine")
 
 DUPLICATE_LOGIN_ID_MESSAGE = "This login ID is already assigned to another account. Please choose a different login ID."
@@ -2371,6 +2372,53 @@ def _save_message_log(db: Session, patient: Patient, message_type: str, result: 
     db.commit()
     return reminder_log_out(log)
 
+
+def _prescription_error(message: str, code: str) -> dict:
+    return {"error": message, "provider": "app", "code": code}
+
+
+def _ensure_prescription_share_token(db: Session, rx: Prescription) -> str:
+    if rx.share_token:
+        return rx.share_token
+    rx.share_token = uuid.uuid4().hex
+    db.add(rx)
+    db.commit()
+    db.refresh(rx)
+    return rx.share_token
+
+
+def _prescription_link_for(db: Session, rx: Prescription) -> str:
+    share_token = _ensure_prescription_share_token(db, rx)
+    return f"{PATIENT_PORTAL_URL}/p/{share_token}"
+
+
+def _send_prescription_message(db: Session, patient: Patient, rx: Prescription) -> tuple[dict, str]:
+    prescription_link = _prescription_link_for(db, rx)
+
+    if not patient.phone:
+        result = _prescription_error("Patient phone number is missing", "missing_phone")
+    elif patient.opted_out:
+        result = _prescription_error("Patient has opted out of WhatsApp messages", "patient_opted_out")
+    elif not patient.reminder_enabled:
+        result = _prescription_error("WhatsApp reminders are disabled for this patient", "reminders_disabled")
+    else:
+        from app.whatsapp import send_prescription_whatsapp
+
+        result = send_prescription_whatsapp(
+            phone=patient.phone,
+            patient_name=patient.name,
+            clinic_name=_clinic_name_for(patient),
+            prescription_link=prescription_link,
+        )
+
+    try:
+        result["reminder"] = _save_message_log(db, patient, "prescription", result)
+    except Exception:
+        db.rollback()
+        logging.exception("Could not save prescription reminder log for patient %s", patient.id)
+
+    return result, prescription_link
+
 def _send_visit_thank_you(db: Session, patient: Patient, visit: Visit) -> dict:
     if patient.opted_out:
         return {"skipped": True, "reason": "patient_opted_out"}
@@ -2916,40 +2964,30 @@ def create_prescription(
     db.commit()
     db.refresh(rx)
 
-    prescription_link = f"{PATIENT_PORTAL_URL}/p/{share_token}"
+    prescription_link = _prescription_link_for(db, rx)
 
     # Auto WhatsApp — doctor does nothing extra
-    _auto_send_prescription_whatsapp(db, patient, rx, prescription_link)
+    _auto_send_prescription_whatsapp(db, patient, rx)
 
     return {**rx.__dict__, "prescription_link": prescription_link}
 
 
-def _auto_send_prescription_whatsapp(db, patient, rx, prescription_link: str):
+def _auto_send_prescription_whatsapp(db: Session, patient: Patient, rx: Prescription):
     """Fires silently after prescription saved. Never blocks the response."""
     try:
-        if not patient.phone or patient.opted_out or not patient.reminder_enabled:
-            return
-
-        clinic = db.query(Clinic).filter(Clinic.id == patient.clinic_id).first()
-        clinic_name = clinic.name if clinic else "your clinic"
-
-        from app.whatsapp import send_prescription_whatsapp
-        result = send_prescription_whatsapp(
-            phone=patient.phone,
-            patient_name=patient.name,
-            clinic_name=clinic_name,
-            prescription_link=prescription_link,
-        )
-
-        log = ReminderLog(
-            patient_id=patient.id,
-            reminder_type="prescription",
-            success="error" not in result,
-            error=result.get("error"),
-        )
-        db.add(log)
-        db.commit()
-
+        result, prescription_link = _send_prescription_message(db, patient, rx)
+        if "error" in result:
+            logger.warning(
+                "Prescription WhatsApp send failed for patient %s: %s",
+                patient.id,
+                result.get("error"),
+            )
+        else:
+            logger.info(
+                "Prescription WhatsApp queued for patient %s with link %s",
+                patient.id,
+                prescription_link,
+            )
     except Exception:
         logger.exception("Auto prescription WhatsApp failed for patient %s", patient.id)
 
@@ -3082,10 +3120,15 @@ def send_whatsapp_prescription(patient_id: int, db: Session = Depends(get_db), c
     latest_rx = db.query(Prescription).filter(Prescription.patient_id == patient_id).order_by(Prescription.created_at.desc()).first()
     if not latest_rx:
         raise HTTPException(status_code=404, detail="No prescription found")
-    from app.whatsapp import build_prescription_message, send_whatsapp_message
-    msg = build_prescription_message(patient, latest_rx)
-    result = send_whatsapp_message(patient.phone, patient.name, "thank_you", {"clinic_name": "DocNudge", "condition": "Prescription", "next_visit": None, "care_tip": msg[:120]})
-    return {"success": "error" not in result, "message": msg}
+    result, prescription_link = _send_prescription_message(db, patient, latest_rx)
+    success = "error" not in result
+    message = "Prescription sent successfully" if success else result.get("error", "Prescription was not sent")
+    return {
+        "success": success,
+        "result": result,
+        "prescription_link": prescription_link,
+        "message": message,
+    }
 
 
 @app.post("/whatsapp/recovery/{patient_id}")

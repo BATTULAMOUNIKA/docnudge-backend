@@ -14,9 +14,13 @@ WEBHOOK_VERIFY_TOKEN            = os.getenv("WEBHOOK_VERIFY_TOKEN")          # l
 
 # ── Template names (must match Meta exactly) ────────────────
 INTERAKT_LANGUAGE_CODE          = os.getenv("INTERAKT_LANGUAGE_CODE", "en").strip()
+INTERAKT_TEMPLATE_THANK_YOU     = os.getenv("INTERAKT_TEMPLATE_THANK_YOU", "docnudge_thank_you_after_visit").strip()
+INTERAKT_TEMPLATE_TWO_DAYS_BEFORE = os.getenv("INTERAKT_TEMPLATE_TWO_DAYS_BEFORE", "docnudge_two_days_before").strip()
 INTERAKT_TEMPLATE_PRESCRIPTION  = os.getenv("INTERAKT_TEMPLATE_PRESCRIPTION",  "docnudge_prescription").strip()
 INTERAKT_TEMPLATE_DAY_BEFORE    = os.getenv("INTERAKT_TEMPLATE_DAY_BEFORE",    "docnudge_day_before").strip()
+INTERAKT_TEMPLATE_MORNING       = os.getenv("INTERAKT_TEMPLATE_MORNING", "docnudge_morning_of_visit").strip()
 INTERAKT_TEMPLATE_MISSED_FOLLOWUP = os.getenv("INTERAKT_TEMPLATE_MISSED_FOLLOWUP", "docnudge_missed_followup").strip()
+INTERAKT_TEMPLATE_WEEKLY_REPORT = os.getenv("INTERAKT_TEMPLATE_WEEKLY_REPORT", "docnudge_weekly_report").strip()
 INTERAKT_TIMEOUT_SECONDS        = int(os.getenv("INTERAKT_TIMEOUT_SECONDS", "12"))
 
 # ── AI ──────────────────────────────────────────────────────

@@ -7,9 +7,13 @@ from app.config import (
     WHATSAPP_ACCESS_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID,
     INTERAKT_LANGUAGE_CODE,
+    INTERAKT_TEMPLATE_THANK_YOU,
+    INTERAKT_TEMPLATE_TWO_DAYS_BEFORE,
     INTERAKT_TEMPLATE_DAY_BEFORE,
+    INTERAKT_TEMPLATE_MORNING,
     INTERAKT_TEMPLATE_MISSED_FOLLOWUP,
     INTERAKT_TEMPLATE_PRESCRIPTION,
+    INTERAKT_TEMPLATE_WEEKLY_REPORT,
     INTERAKT_TIMEOUT_SECONDS,
 )
 
@@ -19,15 +23,16 @@ DEFAULT_CLINIC_NAME = "your clinic"
 META_API_VERSION    = "v20.0"
 META_API_BASE       = f"https://graph.facebook.com/{META_API_VERSION}"
 
-# ── Template registry (3 templates only) ───────────────────
-#   docnudge_prescription    → thank you + prescription link (fires after visit)
-#   docnudge_day_before      → reminder + clinic number + confirm/reschedule buttons
-#   docnudge_missed_followup → recovery message
+# ── Template registry ───────────────────────────────────────
 
 TEMPLATE_BY_MESSAGE_TYPE = {
+    "thank_you": INTERAKT_TEMPLATE_THANK_YOU,
+    "two_days_before": INTERAKT_TEMPLATE_TWO_DAYS_BEFORE,
     "prescription":   INTERAKT_TEMPLATE_PRESCRIPTION,
     "day_before":     INTERAKT_TEMPLATE_DAY_BEFORE,
+    "morning": INTERAKT_TEMPLATE_MORNING,
     "missed_followup": INTERAKT_TEMPLATE_MISSED_FOLLOWUP,
+    "weekly_report": INTERAKT_TEMPLATE_WEEKLY_REPORT,
 }
 
 
@@ -98,12 +103,19 @@ def _body_values_for(
 ) -> list[str]:
     context      = context or {}
     clinic_name  = context.get("clinic_name") or DEFAULT_CLINIC_NAME
+    condition    = context.get("condition") or "Follow-up"
     next_visit   = _format_date(context.get("next_visit") or context.get("followup_date"))
+    care_tip     = context.get("care_tip") or care_tip_for(condition)
+    appointment_time = context.get("appointment_time") or "your scheduled time"
+    clinic_address = context.get("clinic_address") or "the clinic"
     clinic_phone = context.get("clinic_phone") or "the clinic"
     rx_link      = context.get("prescription_link") or ""
     missed_date  = _format_date(context.get("missed_date") or context.get("next_visit"))
 
     values_by_type = {
+        "thank_you": [patient_name, clinic_name, condition, next_visit, care_tip],
+        "two_days_before": [patient_name, clinic_name, next_visit, care_tip],
+
         # docnudge_prescription
         # {{1}} patient name | {{2}} clinic name | {{3}} prescription link
         "prescription": [patient_name, clinic_name, rx_link],
@@ -112,9 +124,20 @@ def _body_values_for(
         # {{1}} patient name | {{2}} clinic name | {{3}} date | {{4}} clinic phone
         "day_before": [patient_name, clinic_name, next_visit, clinic_phone],
 
+        "morning": [patient_name, appointment_time, clinic_address],
+
         # docnudge_missed_followup
         # {{1}} patient name | {{2}} clinic name | {{3}} date | {{4}} clinic phone
         "missed_followup": [patient_name, clinic_name, missed_date, clinic_phone],
+
+        "weekly_report": [
+            clinic_name,
+            context.get("total_patients", "0"),
+            context.get("visits_completed", "0"),
+            context.get("missed_count", "0"),
+            context.get("return_rate", "0%"),
+            context.get("summary", "No action needed."),
+        ],
     }
     return [str(v) for v in values_by_type.get(
         message_type, [patient_name, clinic_name, next_visit]
@@ -252,6 +275,27 @@ def send_prescription_whatsapp(
         context={
             "clinic_name":       clinic_name,
             "prescription_link": prescription_link,
+        },
+    )
+
+
+def send_visit_thank_you_message(
+    phone: str,
+    patient_name: str,
+    condition: str | None,
+    next_visit,
+    clinic_name: str | None = None,
+) -> dict:
+    """Compatibility wrapper for existing visit flows."""
+    return send_whatsapp_message(
+        phone=phone,
+        patient_name=patient_name,
+        reminder_type="thank_you",
+        context={
+            "clinic_name": clinic_name or DEFAULT_CLINIC_NAME,
+            "condition": condition,
+            "next_visit": next_visit,
+            "care_tip": care_tip_for(condition),
         },
     )
 
