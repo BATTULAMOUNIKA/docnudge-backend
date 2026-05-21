@@ -8,6 +8,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+# ── Helpers ─────────────────────────────────────────────────
+
 def get_patients_for_reminder(db: Session, target_date: date):
     return (
         db.query(Patient, Visit)
@@ -19,6 +22,7 @@ def get_patients_for_reminder(db: Session, target_date: date):
         .filter(Patient.followup_enabled == True)
         .all()
     )
+
 
 def mark_missed_followups(db: Session, today: date):
     visits = (
@@ -34,6 +38,7 @@ def mark_missed_followups(db: Session, today: date):
     if visits:
         db.commit()
 
+
 def already_sent(db: Session, patient_id: int, reminder_type: str, today: date) -> bool:
     from sqlalchemy import func
     return (
@@ -47,70 +52,76 @@ def already_sent(db: Session, patient_id: int, reminder_type: str, today: date) 
         is not None
     )
 
-def run_reminders(reminder_type: str):
-    today = date.today()
 
-    # Map reminder type to how many days before the visit
-    days_before = {
-        "two_days_before": 2,
-        "day_before":      1,
-        "morning":         0,
-    }
-    target_date = today + timedelta(days=days_before[reminder_type])
+# ── Day Before Reminder ─────────────────────────────────────
+# Only 1 reminder type now — day_before
+# Replaces old: two_days_before + morning (those templates don't exist in Meta)
+
+def run_day_before_reminder():
+    """
+    Sends docnudge_day_before template to all patients
+    whose follow-up is tomorrow.
+    Runs daily at 9 AM via APScheduler.
+    """
+    today       = date.today()
+    target_date = today + timedelta(days=1)
 
     db = SessionLocal()
     try:
         mark_missed_followups(db, today)
         patients = get_patients_for_reminder(db, target_date)
-        logger.info(f"[{reminder_type}] Found {len(patients)} patient(s) for {target_date}")
+        logger.info("[day_before] Found %d patient(s) for %s", len(patients), target_date)
 
         for patient, visit in patients:
-            if already_sent(db, patient.id, reminder_type, today):
-                logger.info(f"Already sent {reminder_type} to {patient.name}, skipping.")
+            if already_sent(db, patient.id, "day_before", today):
+                logger.info("Already sent day_before to %s, skipping.", patient.name)
                 continue
+
+            clinic       = patient.clinic
+            clinic_name  = clinic.name  if clinic else "your clinic"
+            clinic_phone = clinic.phone if clinic else ""
 
             result = send_whatsapp_message(
                 phone=patient.phone,
                 patient_name=patient.name,
-                reminder_type=reminder_type,
+                reminder_type="day_before",
                 context={
-                    "clinic_name": patient.clinic.name if patient.clinic else "your clinic",
-                    "condition": visit.condition or patient.condition,
-                    "followup_date": visit.followup_date or visit.next_visit,
-                    "next_visit": visit.followup_date or visit.next_visit,
+                    "clinic_name":  clinic_name,
+                    "next_visit":   visit.followup_date or visit.next_visit,
+                    "clinic_phone": clinic_phone,
                 },
             )
 
-            success = "error" not in result
+            success   = "error" not in result
             error_msg = result.get("error") if not success else None
 
-            log = ReminderLog(
+            db.add(ReminderLog(
                 patient_id=patient.id,
-                reminder_type=reminder_type,
+                reminder_type="day_before",
                 success=success,
                 error=error_msg,
-            )
-            db.add(log)
+                message_id=result.get("id"),   # Meta returns 'id' not 'sid'
+            ))
             db.commit()
 
-            status = f"✅ sent (sid: {result.get('sid')})" if success else f"❌ failed: {error_msg}"
-            logger.info(f"{patient.name} ({patient.phone}) — {status}")
+            status = f"✅ sent (id: {result.get('id')})" if success else f"❌ failed: {error_msg}"
+            logger.info("%s (%s) — %s", patient.name, patient.phone, status)
 
     finally:
         db.close()
 
-def trigger_two_days_before():
-    run_reminders("two_days_before")
 
-def trigger_day_before():
-    run_reminders("day_before")
-
-def trigger_morning():
-    run_reminders("morning")
+# ── Missed Follow-up Recovery ───────────────────────────────
 
 def trigger_missed_followups():
-    today = date.today()
+    """
+    Sends docnudge_missed_followup template to patients
+    who missed their follow-up 3 days ago.
+    Runs daily at 10 AM via APScheduler.
+    """
+    today       = date.today()
     target_date = today - timedelta(days=3)
+
     db = SessionLocal()
     try:
         rows = (
@@ -123,29 +134,56 @@ def trigger_missed_followups():
             .filter(Patient.followup_enabled == True)
             .all()
         )
+        logger.info("[missed_followup] Found %d patient(s) for %s", len(rows), target_date)
+
         for patient, visit in rows:
             if already_sent(db, patient.id, "missed_followup", today):
                 continue
+
+            clinic       = patient.clinic
+            clinic_name  = clinic.name  if clinic else "your clinic"
+            clinic_phone = clinic.phone if clinic else ""
+
             result = send_whatsapp_message(
                 phone=patient.phone,
                 patient_name=patient.name,
                 reminder_type="missed_followup",
                 context={
-                    "clinic_name": patient.clinic.name if patient.clinic else "your clinic",
-                    "condition": visit.condition or patient.condition,
-                    "followup_date": visit.followup_date or visit.next_visit,
-                    "next_visit": visit.followup_date or visit.next_visit,
-                    "clinic_phone": patient.clinic.phone if patient.clinic else "the clinic",
+                    "clinic_name":  clinic_name,
+                    "missed_date":  visit.followup_date or visit.next_visit,
+                    "clinic_phone": clinic_phone,
                 },
             )
-            db.add(
-                ReminderLog(
-                    patient_id=patient.id,
-                    reminder_type="missed_followup",
-                    success="error" not in result,
-                    error=result.get("error"),
-                )
-            )
+
+            success = "error" not in result
+            db.add(ReminderLog(
+                patient_id=patient.id,
+                reminder_type="missed_followup",
+                success=success,
+                error=result.get("error") if not success else None,
+                message_id=result.get("id"),
+            ))
             db.commit()
+
+            status = f"✅ sent" if success else f"❌ failed: {result.get('error')}"
+            logger.info("%s (%s) — %s", patient.name, patient.phone, status)
+
     finally:
         db.close()
+
+
+# ── Trigger functions (called by APScheduler in main.py) ───
+
+def trigger_day_before():
+    run_day_before_reminder()
+
+
+# ── Keep old names so main.py doesn't break ────────────────
+# These now do nothing — old templates don't exist in Meta
+# Remove them from APScheduler in main.py when convenient
+
+def trigger_two_days_before():
+    logger.info("[two_days_before] Skipped — template removed. Using day_before only.")
+
+def trigger_morning():
+    logger.info("[morning] Skipped — template removed. Using day_before only.")
